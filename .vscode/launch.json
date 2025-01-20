@@ -1,0 +1,139 @@
+{
+    // IntelliSense를 사용하여 가능한 특성에 대해 알아보세요.
+    // 기존 특성에 대한 설명을 보려면 가리킵니다.
+    // 자세한 내용을 보려면 https://go.microsoft.com/fwlink/?linkid=830387을(를) 방문하세요.
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Python 디버거: 현재 파일",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "fine_tune.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "fine_tune.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--dataset", "coco",
+                "--output_dir", "./",
+                "--pretrained_model_name_or_path", "CompVis/stable-diffusion-v1-4",
+                "--resolution", "512",
+                "--train_batch_size", "4",
+                "--lr_warmup_steps", "0",
+                "--gradient_accumulation_steps", "1",
+                "--max_train_steps", "1000",
+                "--learning_rate", "5.0e-04",
+                "--scale_lr", "--lr_scheduler", "constant",
+                "--mixed_precision", "fp16",
+                "--revision", "fp16",
+                "--gradient_checkpointing", "--only_save_embeds", 
+                "--num-trials", "8",
+                // "--examples-per-class", "[1, 2, 4, 8, 16]",
+            ]
+        },
+        {
+            "name": "train_classifier.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "train_classifier.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                // "DISPLAY": "11.0",
+                "CUDA_VISIBLE_DEVICES":"1"
+            },
+            "args": [
+                "--logdir", "coco-baselines/textual-inversion-0.5",
+                // "--synthetic-dir", "aug/textual-inversion-0.5/{dataset}-{seed}-{examples_per_class}",
+                "--dataset", "coco",
+                "--prompt", "a photo of a {name}",
+                "--aug", "textual-inversion",
+                "--guidance-scale", "7.5",
+                "--strength", "0.5",
+                "--mask", "0",
+                "--inverted", "0",
+                "--num-synthetic", "10",
+                "--synthetic-probability", "0.5",
+                "--num-trials", "1",
+                "--examples-per-class", "4"
+            ]
+        },
+        {
+            "name": "fine_tune_extract.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "fine_tune_extract.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--dataset", "mvtec_ad",
+                "--output_dir", "./output_mvtec",
+                "--pretrained_model_name_or_path", "CompVis/stable-diffusion-v1-4",
+                "--resolution", "512",
+                "--train_batch_size", "4",
+                "--lr_warmup_steps", "0",
+                "--gradient_accumulation_steps", "1",
+                "--max_train_steps", "1000",
+                "--learning_rate", "5.0e-04",
+                "--scale_lr", "--lr_scheduler", "constant",
+                "--mixed_precision", "fp16",
+                "--revision", "fp16",
+                "--gradient_checkpointing", "--only_save_embeds", 
+                "--num-trials", "8",
+                "--examples-per-class", "1"
+            ]
+        },
+        {
+            "name": "fine_tune_mvtec.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "fine_tune_mvtec.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--dataset", "mvtec_ad",
+                "--output_dir", "./output_mvtec",
+                "--pretrained_model_name_or_path", "CompVis/stable-diffusion-v1-4",
+                "--resolution", "512",
+                "--train_batch_size", "8",
+                "--lr_warmup_steps", "0",
+                "--gradient_accumulation_steps", "1",
+                "--max_train_steps", "1000",
+                "--learning_rate", "5.0e-04",
+                "--scale_lr", "--lr_scheduler", "constant",
+                "--mixed_precision", "fp16",
+                "--revision", "fp16",
+                "--gradient_checkpointing", "--only_save_embeds", 
+                "--num-trials", "2",
+                "--examples-per-class", "1"
+            ]
+        },
+        {
+            "name": "generate_augmentations_mvtec.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "generate_augmentations_mvtec.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--dataset", "mvtec_ad_subset",
+                "--embed-path", "mvtec_ad_subset-tokens/mvtec_ad_subset-0-4.pt",
+                "--out", "output_mvtec_ad_subset_test/aug",
+                "--examples-per-class", "4",
+                "--seed", "0",
+                "--num-synthetic", "2",
+            ],
+        },
+    ]
+}
