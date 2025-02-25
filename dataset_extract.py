@@ -20,7 +20,7 @@ from semantic_aug.datasets.spurge import SpurgeDataset
 from semantic_aug.datasets.imagenet import ImageNetDataset
 from semantic_aug.datasets.pascal import PASCALDataset
 from semantic_aug.datasets.mvtec import MvtecDataset
-# from semantic_aug.datasets.mvtec_subset import MvtecDataset_subset
+from semantic_aug.datasets.mvtec_normal import MvtecDataset_Normal
 
 # import datasets
 # import diffusers
@@ -49,22 +49,18 @@ DATASETS = {
     "imagenet": ImageNetDataset,
     "mvtec_ad": MvtecDataset,
     "mvtec_ad_setA": MvtecDataset,
+    "mvtec_ad_normal": MvtecDataset_Normal,
 }
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Extract dataset for training")
 
     parser.add_argument("--examples-per-class", nargs='+', type=int, default=[4, 8, 16])
-    parser.add_argument("--dataset", type=str, default="mvtec_ad_setA", choices=["mvtec_ad", "mvtec_ad_setA"])
-    parser.add_argument("--output-dir", type=str, default="output_A")
+    parser.add_argument("--dataset", type=str, default="mvtec_ad_normal", choices=["mvtec_ad", "mvtec_ad_setA", "mvtec_ad_normal"])
+    parser.add_argument("--output-dir", type=str, default="output_normal_2.1")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--num-trials", type=int, default=1)
-
     args = parser.parse_args()
-    # env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    # if env_local_rank != -1 and env_local_rank != args.local_rank:
-    #     args.local_rank = env_local_rank
-
     return args
 
 
@@ -72,14 +68,6 @@ if __name__ == "__main__":
 
     args = parse_args()
     output_dir = args.output_dir
-
-    # rank = int(os.environ.pop("RANK", 0))
-    # world_size = int(os.environ.pop("WORLD_SIZE", 1))
-
-    # device_id = rank % torch.cuda.device_count()        
-    # torch.cuda.set_device(rank % torch.cuda.device_count())
-
-    # print(f'Initialized process {rank} / {world_size}')
 
     options = product(range(args.num_trials), args.examples_per_class)
     options = np.array(list(options))
@@ -93,9 +81,6 @@ if __name__ == "__main__":
             
         os.makedirs(os.path.join(output_dir, "extracted"), exist_ok=True)
 
-        # train_dataset = DATASETS[
-        #     args.dataset](split="train", seed=seed, 
-        #                   examples_per_class=examples_per_class)
         train_dataset = DATASETS[
             args.dataset](args=args, examples_per_class=examples_per_class, seed=seed)
 
@@ -103,13 +88,15 @@ if __name__ == "__main__":
 
             image = train_dataset.get_image_by_idx(idx)
             metadata = train_dataset.get_metadata_by_idx(idx)
-
             name = metadata["name"].replace(" ", "_")
-            path = f"{args.dataset}-{seed}-{examples_per_class}"
+            setting = f"{args.dataset}-{seed}-{examples_per_class}"
 
-            path = os.path.join(output_dir, "extracted", path, name, f"{idx}.png")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if metadata['is_anomaly']:  # 비정상 이미지
+                path = os.path.join(output_dir, "extracted", setting, "anomaly", name, f"{idx}.png")
+            else:                       # 정상 이미지 
+                path = os.path.join(output_dir, "extracted", setting, "good", name, f"{idx}.png")
             
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             image.save(path)
         
         # [extracted/dataset-seed-img개수] 폴더에 각각 class별 이미지 폴더 저장

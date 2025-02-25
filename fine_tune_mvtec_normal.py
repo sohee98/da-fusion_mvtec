@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.utils.data import Dataset
+from tqdm import trange
+from torch import autocast
 
 from semantic_aug.datasets.coco import COCODataset
 from semantic_aug.datasets.spurge import SpurgeDataset
@@ -41,6 +43,8 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 import datetime
+from semantic_aug.datasets.mvtec_normal import MvtecDataset_Normal
+
 
 DATASETS = {
     "spurge": SpurgeDataset, 
@@ -52,6 +56,7 @@ DATASETS = {
     "mvtec_ad_subset_2": MvtecDataset,
     "mvtec_ad_subset_3": MvtecDataset,
     "mvtec_ad_setA": MvtecDataset,
+    "mvtec_ad_normal": MvtecDataset_Normal,
 }
 
 
@@ -154,7 +159,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./output_A/",
+        default="./output_normal/",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -290,8 +295,8 @@ def parse_args():
     parser.add_argument("--num-trials", type=int, default=8)
     parser.add_argument("--examples-per-class", nargs='+', type=int, default=[4, 8, 16])
     
-    parser.add_argument("--dataset", type=str, default="mvtec_ad_setA", 
-                        choices=["spurge", "imagenet", "coco", "pascal", "mvtec_ad", "mvtec_ad_setA"])
+    parser.add_argument("--dataset", type=str, default="mvtec_ad_normal", 
+                        choices=["spurge", "imagenet", "coco", "pascal", "mvtec_ad", "mvtec_ad_setA", "mvtec_ad_normal"])
 
     parser.add_argument("--unet-ckpt", type=str, default=None)
 
@@ -375,7 +380,7 @@ class TextualInversionDataset(Dataset):
         class_token_list=None,              # add
         anomaly_token_list=None,            # add
     ):
-        self.data_root = data_root
+        self.data_root = data_root          # /extracted 폴더  './output_normal/extracted/mvtec_ad_normal-0-4'
         self.tokenizer = tokenizer
         self.learnable_property = learnable_property
         self.size = size
@@ -384,37 +389,26 @@ class TextualInversionDataset(Dataset):
         self.flip_p = flip_p
 
         '''
-        self.image_paths
-        ['./output_A/extracted/mvtec_ad_setA-0-4/metal_nut-scratch', 
-        './output_A/extracted/mvtec_ad_setA-0-4/pill-scratch', 
-        './output_A/extracted/mvtec_ad_setA-0-4/pill-color', 
-        './output_A/extracted/mvtec_ad_setA-0-4/metal_nut-color']
-        '''
+        anomaly 폴더 
+        /output_normal/extracted/mvtec_ad_normal-0-4/anomaly/metal_nut-color
 
-        # 이미지 경로, class_token, anomaly_token 매핑
+        normal 폴더
+        /output_normal/extracted/mvtec_ad_normal-0-4/good/metal_nut
+        '''
         self.image_paths = []
         self.class_tokens = []
         self.anomaly_tokens = []
 
-        # data_root 내부의 하위 디렉토리를 순회하며 매핑 생성
-        for folder in os.listdir(data_root):
-            folder_path = os.path.join(data_root, folder)
-            if not os.path.isdir(folder_path):
-                continue  # 폴더가 아닌 경우 건너뜀
-
-            # 폴더 이름에서 class와 anomaly 추출
-            class_name, anomaly_name = folder.split("-")
-            class_token = f"<{class_name}>"
-            anomaly_token = f"<{anomaly_name}>"
-
-            # 폴더 내 이미지 경로 추가
-            for image_file in os.listdir(folder_path):
-                if image_file.lower().endswith((".png", ".jpg", ".jpeg")):
-                    self.image_paths.append(os.path.join(folder_path, image_file))
-                    self.class_tokens.append(class_token)
-                    self.anomaly_tokens.append(anomaly_token) 
+        ##### Step 구분: anomaly_token_list가 없으면 정상 이미지만 학습
+        self.step = 'step1' if anomaly_token_list is None else 'step2'
+        
+        if self.step == 'step1': ## normal 이미지로만 학습 (step 1)
+            self._load_normal_images()
+        else:
+            self._load_anomaly_images()
 
         self.num_images = len(self.image_paths)     # 전체 이미지 갯수
+        self._length = self.num_images * repeats if mode == "train" else self.num_images
 
         # 유효성 검사
         if class_token_list:    # ['<metal_nut>', '<pill>']
@@ -424,7 +418,6 @@ class TextualInversionDataset(Dataset):
             assert set(self.anomaly_tokens) <= set(anomaly_token_list), \
                 "Some anomaly tokens in the dataset are not in the anomaly_token_list."
 
-        self._length = self.num_images * repeats if mode == "train" else self.num_images
         self.interpolation = {
             "linear": PIL_INTERPOLATION["linear"],
             "bilinear": PIL_INTERPOLATION["bilinear"],
@@ -438,49 +431,71 @@ class TextualInversionDataset(Dataset):
     def __len__(self):
         return self._length     # 전체 이미지 갯수 * repeats
 
+    def _load_normal_images(self):
+        normal_root = os.path.join(self.data_root, 'good')
+        for class_name in os.listdir(normal_root):
+            folder_path = os.path.join(normal_root, class_name)
+            if os.path.isdir(folder_path):
+                class_token = f"<{class_name}>"
+                for image_file in os.listdir(folder_path):
+                    if image_file.lower().endswith((".png", ".jpg", ".jpeg")):
+                        self.image_paths.append(os.path.join(folder_path, image_file))
+                        self.class_tokens.append(class_token)
 
-    def __getitem__(self, i):
-        # 인덱스 순환
-        image_index = i % self.num_images
+    def _load_anomaly_images(self):
+        anomaly_root = os.path.join(self.data_root, 'anomaly')
+        for folder in os.listdir(anomaly_root):
+            folder_path = os.path.join(self.data_root, folder)
+            if os.path.isdir(folder_path):
+                class_name, anomaly_name = folder.split("-")
+                class_token = f"<{class_name}>"
+                anomaly_token = f"<{anomaly_name}>"
+                for image_file in os.listdir(folder_path):
+                    if image_file.lower().endswith((".png", ".jpg", ".jpeg")):
+                        self.image_paths.append(os.path.join(folder_path, image_file))
+                        self.class_tokens.append(class_token)
+                        self.anomaly_tokens.append(anomaly_token)
 
-        # 이미지 경로와 대응되는 class, anomaly token
-        image_path = self.image_paths[image_index]
-        class_token = self.class_tokens[image_index]
-        anomaly_token = self.anomaly_tokens[image_index]
-
-        # 이미지 로드 및 전처리
+    def _preprocess_image(self, image_path):
         image = Image.open(image_path)
-        if not image.mode == "RGB":
+        if image.mode != "RGB":
             image = image.convert("RGB")
-
-        # 각 토큰에 대한 텍스트 생성
-        text = f"a photo of {class_token} with {anomaly_token} anomaly"
-
-        input_ids = self.tokenizer(
-            text,
-            padding="max_length",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids[0]
 
         img = np.array(image).astype(np.uint8)
         if self.center_crop:
             crop = min(img.shape[0], img.shape[1])
             h, w = img.shape[0], img.shape[1]
             img = img[(h - crop) // 2 : (h + crop) // 2, (w - crop) // 2 : (w + crop) // 2]
-
+        
         image = Image.fromarray(img).resize((self.size, self.size), resample=self.interpolation)
         image = self.flip_transform(image)
         image = np.array(image).astype(np.uint8)
         pixel_values = (image / 127.5 - 1.0).astype(np.float32)
+        return torch.from_numpy(pixel_values).permute(2, 0, 1)
+    
+    def __getitem__(self, i):
+        image_index = i % self.num_images
+        image_path = self.image_paths[image_index]
+        class_token = self.class_tokens[image_index]
+        pixel_values = self._preprocess_image(image_path)
 
-        return {
-            "pixel_values": torch.from_numpy(pixel_values).permute(2, 0, 1),
-            "input_ids": input_ids,
-            "class_token": class_token,         # class 토큰 추가
-            "anomaly_token": anomaly_token,     # anomaly 토큰 추가
-        }
+        if self.step == 'step1':
+            text = f"a photo of {class_token}"
+            return {
+                "pixel_values": pixel_values,
+                "input_ids": self.tokenizer(text, padding="max_length", truncation=True, max_length=self.tokenizer.model_max_length, return_tensors="pt").input_ids[0],
+                "class_token": class_token,
+            }
+        else:
+            anomaly_token = self.anomaly_tokens[image_index]
+            text = f"a photo of {class_token} with {anomaly_token} anomaly"
+            return {
+                "pixel_values": pixel_values,
+                "input_ids": self.tokenizer(text, padding="max_length", truncation=True, max_length=self.tokenizer.model_max_length, return_tensors="pt").input_ids[0],
+                "class_token": class_token,
+                "anomaly_token": anomaly_token,
+            }
+
 
 
 def get_full_repo_name(model_id: str, organization: Optional[str] = None, token: Optional[str] = None):
@@ -493,19 +508,20 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
         return f"{organization}/{model_id}"
 
 
-def main(args):
-
+def main_step1(args):
+    '''
+    class token 먼저 학습    
+    '''
+    # args.output_dir : './output_normal/fine-tuned/mvtec_ad_normal-0-4'
+    args.output_dir = os.path.join(args.output_dir, 'step_1')
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     os.makedirs(logging_dir, exist_ok=True)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        # logging_dir=logging_dir,                # 에러남
         log_with="wandb",                           # tensorboard 에러나서 wandb로 기록 
-        # log_with=args.report_to,                # tensorboard, wandb, ... 알아서 log 기록 => accelerator.trackers[0].log(logs, step=step)
     )
-
 
     # Make one log on every process with the configuration for debugging. logging 설정.
     logging.basicConfig(
@@ -519,7 +535,6 @@ def main(args):
     )
     logger = logging.getLogger(__name__)
     logger.info(accelerator.state)
-    # logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -529,20 +544,8 @@ def main(args):
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    # ## 추가 - Tracker 초기화
-    # if args.report_to == "tensorboard":
-    #     from torch.utils.tensorboard import SummaryWriter
-    #     writer = SummaryWriter(log_dir=logging_dir)
-    #     logger.info(f"TensorBoard initialized at {logging_dir}")
-    # elif args.report_to == "wandb":
-    #     import wandb
-    #     wandb.init(project=f"{args.dataset}-{seed}-{examples_per_class}", dir=logging_dir)
-    #     logger.info("Weights & Biases initialized")
-
     logger.info(f"Logging directory: {logging_dir}")
 
-    # if accelerator.is_main_process:
-    #     accelerator.init_trackers("textual_inversion", config=vars(args))
     if accelerator.is_main_process:
         accelerator.init_trackers(
             "textual_inversion",
@@ -550,7 +553,7 @@ def main(args):
             init_kwargs={
                 "wandb": {
                     # "project": "textual_inversion",  # 새 프로젝트 이름 설정
-                    "name": f"{args.dataset[9:]}-{args.seed}-{args.examples_per_class}-{datetime.datetime.now().strftime('%m%d_%H%M')}",  # 실험 이름
+                    "name": f"{args.dataset[9:]}-{args.seed}-{args.examples_per_class}-'step1'-{datetime.datetime.now().strftime('%m%d_%H%M')}",  # 실험 이름
                 },
                 "tensorboard": {
                     "logging_dir": logging_dir    # TensorBoard 로그 디렉토리 설정
@@ -600,10 +603,10 @@ def main(args):
         print(f"Loaded UNET from {args.unet_ckpt}")
 
     # Add the placeholder token in tokenizer
-    num_added_tokens = tokenizer.add_tokens(args.placeholder_token_list)     # class_placeholder_tokens + anomaly_placeholder_tokens
+    num_added_tokens = tokenizer.add_tokens(args.class_token_list)     # class_placeholder_tokens
     if num_added_tokens == 0:
         raise ValueError(
-            f"The tokenizer already contains the token {args.placeholder_token_list}. Please pass a different"
+            f"The tokenizer already contains the token {args.class_token_list}. Please pass a different"
             " `placeholder_token` that is not already in the tokenizer."
         )
 
@@ -620,14 +623,12 @@ def main(args):
     
     # Initialise each new placeholder token with the embeddings of the initializer token
     token_embeds = text_encoder.get_input_embeddings().weight.data
-    for placeholder_token in args.placeholder_token_list:
+    for placeholder_token in args.class_token_list:
         placeholder_token_id = tokenizer.convert_tokens_to_ids(placeholder_token)   # 각 placeholder_token의 ID를 가져옴
         token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]     # initializer_token("the")의 임베딩으로 초기화
 
     # placeholder_token_id = tokenizer.convert_tokens_to_ids(args.placeholder_token)  # class_name
     # token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]         # "the"의 embedding 으로 초기화 
-
-
 
     # Freeze vae and unet
     vae.requires_grad_(False)
@@ -679,8 +680,8 @@ def main(args):
         learnable_property=args.learnable_property,
         center_crop=args.center_crop,
         mode="train",
-        class_token_list=args.class_token_list,         # add
-        anomaly_token_list=args.anomaly_token_list      # add
+        class_token_list=args.class_token_list,         # step 1 - class token list 만 사용 
+        # anomaly_token_list=args.anomaly_token_list    
     )
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
 
@@ -740,7 +741,403 @@ def main(args):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"  Placeholder token list = {args.placeholder_token_list}")
+    logger.info(f"  Placeholder token list (Class) = {args.class_token_list}")
+    
+    global_step = 0
+    first_epoch = 0
+
+    # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1]
+        accelerator.print(f"Resuming from checkpoint {path}")
+        accelerator.load_state(os.path.join(args.output_dir, path))
+        global_step = int(path.split("-")[1])
+
+        resume_global_step = global_step * args.gradient_accumulation_steps
+        first_epoch = resume_global_step // num_update_steps_per_epoch
+        resume_step = resume_global_step % num_update_steps_per_epoch
+
+    # Only show the progress bar once on each machine.
+    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Steps")
+
+    # keep original embeddings as reference
+    orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.clone()
+
+    for epoch in range(first_epoch, args.num_train_epochs):
+
+        # token별 업데이트 횟수 저장
+        update_count = {"class_token": {}}
+        for token in args.class_token_list:
+            update_count["class_token"][token] = 0
+
+        text_encoder.train()
+        for step, batch in enumerate(train_dataloader):
+            # Skip steps until we reach the resumed step
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                if step % args.gradient_accumulation_steps == 0:
+                    progress_bar.update(1)
+                continue
+
+            with accelerator.accumulate(text_encoder):
+                # Convert images to latent space
+                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample().detach()    # image [B, 3, 512, 512] -> latents [B, 4, 64, 64]
+                latents = latents * 0.18215      # scaling   # [B, 4, 64, 64]   
+
+                # Add noise to the latents
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)     # random timestep. shape=[4]
+                timesteps = timesteps.long()
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)    # noise 추가된 latents  [B, 4, 64, 64]
+
+                # Class and Anomaly embeddings
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0].to(dtype=weight_dtype)   # [B, 77, 768]
+                ### "a photo of {class_token} with {anomaly_token} anomaly" -> tokenizer -> input_ids -> text_encoder -> hidden_states
+                '''
+                batch["input_ids"].shape [4, 77]   : 각 text에 대한 77개의 token id
+                    tensor([[49406,   320,  1125,   539, 49409,   593, 49410, 46811, 49407, 49407,...49407 ], ...4개])
+                -> text encoder -> [4, 77, 768]
+                '''
+
+                # Predict the noise residual using class and anomaly embeddings
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample     # [B, 4, 64, 64]
+                ### unet에 noisy_latents, timesteps, hidden_states 입력 -> noise 예측
+
+                # Get the target for loss depending on the prediction type
+                if noise_scheduler.config.prediction_type == "epsilon":     # default
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")     # 노이즈 예측 값과 실제 노이즈 값의 차이로 loss 계산
+
+                accelerator.backward(loss)
+
+                # Update embeddings
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+                ### 현재 해당하는 class, anomaly token만 update
+                with accelerator.accumulate(text_encoder):
+                    class_tokens = batch["class_token"]  
+                    # anomaly_tokens = batch["anomaly_token"] 
+
+                    # 업데이트된 토큰들의 횟수 증가
+                    for token in class_tokens:
+                        update_count["class_token"][token] += 1
+                    # for token in anomaly_tokens:
+                    #     update_count["anomaly_token"][token] += 1
+                    # logger.info(f"Updated class token: {class_tokens} / anomaly token: {anomaly_tokens}")
+
+                    update_token_ids = [
+                        tokenizer.convert_tokens_to_ids(token) for token in class_tokens
+                        # tokenizer.convert_tokens_to_ids(token) for token in class_tokens + anomaly_tokens
+                    ]
+
+                    # 기존 임베딩 고정 및 특정 토큰 업데이트
+                    index_no_updates = torch.ones(len(tokenizer), dtype=torch.bool, device=accelerator.device)
+                    for token_id in update_token_ids:           # 학습할 토큰만 False로 설정
+                        index_no_updates[token_id] = False
+
+                    with torch.no_grad():
+                        accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
+                            index_no_updates
+                        ] = orig_embeds_params[index_no_updates]
+
+
+            ## 새롭게 추가된 모든 placeholder token의 인덱스 가져오기 - class token 만
+            # placeholder_token_ids = [tokenizer.convert_tokens_to_ids(token) for token in args.placeholder_token_list]   # [49408. 49409. 49410. 49411]
+            placeholder_token_ids = [tokenizer.convert_tokens_to_ids(token) for token in args.class_token_list]   
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                if global_step % args.save_steps == 0:
+                    # save_path = os.path.join(args.output_dir, f"learned_embeds-steps-{global_step}.bin")
+                    save_path = os.path.join(args.output_dir, f"learned_embeds-steps-{global_step}.pt")     # bin -> pt로 저장
+                    save_progress(text_encoder, placeholder_token_ids, accelerator, args, save_path)        # 여러 토큰 전달
+                    # save_progress(text_encoder, placeholder_token_id, accelerator, args, save_path)
+
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            accelerator.trackers[0].log(logs, step=global_step)
+            progress_bar.set_postfix(**logs)
+            # accelerator.log(logs, step=global_step)
+
+            if global_step >= args.max_train_steps:
+                break
+        
+        # 학습 종료 후 로깅
+        # logger.info("Class token update counts:")
+        # for token, count in update_count["class_token"].items():
+        #     logger.info(f"{token}: {count} updates")
+
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        # Save the newly trained embeddings
+        # save_path = os.path.join(args.output_dir, "learned_embeds.bin")
+        save_path = os.path.join(args.output_dir, f"{args.dataset}-{seed}-{examples_per_class}.pt")         # bin -> pt로 저장
+        save_progress(text_encoder, placeholder_token_ids, 
+                      accelerator, args, save_path)
+
+    accelerator.end_training()
+    accelerator.free_memory()
+
+    del accelerator, vae, unet, text_encoder
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def main_step2(args):
+    '''
+    step 1에서 학습한 class token을 고정하고, anomaly token 학습
+     => './output_normal/fine-tuned/mvtec_ad_normal-0-4/step_1/mvtec_ad_normal-0-4.pt' 에서 학습한 class token 가져와야함.
+    '''
+    # args.output_dir : './output_normal/fine-tuned/mvtec_ad_normal-0-4'
+    args.output_dir = os.path.join(args.output_dir, 'step_2')
+    logging_dir = os.path.join(args.output_dir, args.logging_dir)
+    os.makedirs(logging_dir, exist_ok=True)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with="wandb",                           # tensorboard 에러나서 wandb로 기록 
+    )
+
+    # Make one log on every process with the configuration for debugging. logging 설정.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler(os.path.join(logging_dir, "training.log")),  # 로그 파일 저장
+            logging.StreamHandler()  # 터미널 출력
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    logger.info(accelerator.state)
+    if accelerator.is_local_main_process:
+        datasets.utils.logging.set_verbosity_warning()
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        datasets.utils.logging.set_verbosity_error()
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
+    logger.info(f"Logging directory: {logging_dir}")
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            "textual_inversion",
+            config=vars(args),
+            init_kwargs={
+                "wandb": {
+                    # "project": "textual_inversion",  # 새 프로젝트 이름 설정
+                    "name": f"{args.dataset[9:]}-{args.seed}-{args.examples_per_class}-'step2'-{datetime.datetime.now().strftime('%m%d_%H%M')}",  # 실험 이름
+                },
+                "tensorboard": {
+                    "logging_dir": logging_dir    # TensorBoard 로그 디렉토리 설정
+                }
+            }
+        )
+
+    # If passed along, set the training seed now.
+    if args.seed is not None:
+        set_seed(args.seed)
+
+    # Handle the repository creation
+    if accelerator.is_main_process:
+        if args.push_to_hub:            # hugging face hub에 푸시할지 여부 
+            if args.hub_model_id is None:
+                repo_name = get_full_repo_name(Path(args.output_dir).name, token=args.hub_token)
+            else:
+                repo_name = args.hub_model_id
+            repo = Repository(args.output_dir, clone_from=repo_name)
+
+            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore: # gitignore에 output 파일 추가
+                if "step_*" not in gitignore:
+                    gitignore.write("step_*\n")
+                if "epoch_*" not in gitignore:
+                    gitignore.write("epoch_*\n")
+        elif args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+
+    # Load tokenizer
+    if args.tokenizer_name:
+        tokenizer = CLIPTokenizer.from_pretrained(args.tokenizer_name)
+    elif args.pretrained_model_name_or_path:    # "CompVis/stable-diffusion-v1-4"
+        tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
+
+    # Load scheduler and models
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+    )
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+    )
+
+    if args.unet_ckpt is not None:
+        unet.load_state_dict(torch.load(args.unet_ckpt))
+        print(f"Loaded UNET from {args.unet_ckpt}")
+
+    # Add the placeholder token in tokenizer
+    num_added_tokens = tokenizer.add_tokens(args.anomaly_token_list)     # anomaly_placeholder_tokens
+    if num_added_tokens == 0:
+        raise ValueError(
+            f"The tokenizer already contains the token {args.anomaly_token_list}. Please pass a different"
+            " `placeholder_token` that is not already in the tokenizer."
+        )
+
+    # Convert the initializer_token, placeholder_token to ids
+    token_ids = tokenizer.encode(args.initializer_token, add_special_tokens=False)  # initializer_token = "the"
+    # Check if initializer_token is a single token or a sequence of tokens
+    if len(token_ids) > 1:
+        raise ValueError("The initializer token must be a single token.")
+
+    initializer_token_id = token_ids[0]                                             # "the"
+
+    # Resize the token embeddings as we are adding new special tokens to the tokenizer
+    text_encoder.resize_token_embeddings(len(tokenizer))    # 새로 추가한 token 때문에 token embedding 크기 조절
+    
+    # Initialise each new placeholder token with the embeddings of the initializer token
+    token_embeds = text_encoder.get_input_embeddings().weight.data
+    for placeholder_token in args.anomaly_token_list:
+        placeholder_token_id = tokenizer.convert_tokens_to_ids(placeholder_token)   # 각 placeholder_token의 ID를 가져옴
+        token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]     # initializer_token("the")의 임베딩으로 초기화
+
+    # placeholder_token_id = tokenizer.convert_tokens_to_ids(args.placeholder_token)  # class_name
+    # token_embeds[placeholder_token_id] = token_embeds[initializer_token_id]         # "the"의 embedding 으로 초기화 
+
+
+
+    # Freeze vae and unet
+    vae.requires_grad_(False)
+    unet.requires_grad_(False)
+    # Freeze all parameters except for the token embeddings in text encoder. 토큰 임베딩만 학습가능하도록 고정.
+    text_encoder.text_model.encoder.requires_grad_(False)
+    text_encoder.text_model.final_layer_norm.requires_grad_(False)
+    text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
+
+    if args.gradient_checkpointing:
+        # Keep unet in train mode if we are using gradient checkpointing to save memory.
+        # The dropout cannot be != 0 so it doesn't matter if we are in eval or train mode.
+        unet.train()
+        text_encoder.gradient_checkpointing_enable()
+        unet.enable_gradient_checkpointing()
+
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            unet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xformers is not available. Make sure it is installed correctly")
+
+    # Enable TF32 for faster training on Ampere GPUs,
+    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    if args.scale_lr:
+        args.learning_rate = (
+            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        )
+
+    # Initialize the optimizer
+    optimizer = torch.optim.AdamW(
+        text_encoder.get_input_embeddings().parameters(),  # only optimize the embeddings 임베딩만 학습.
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+
+    # Dataset and DataLoaders creation:
+    train_dataset = TextualInversionDataset(
+        data_root=args.train_data_dir,          # extracted 폴더. 데이터셋 새로 저장한 폴더.
+        tokenizer=tokenizer,
+        size=args.resolution,
+        placeholder_token_list=args.placeholder_token_list,
+        repeats=args.repeats,
+        learnable_property=args.learnable_property,
+        center_crop=args.center_crop,
+        mode="train",
+        class_token_list=args.class_token_list,         
+        anomaly_token_list=args.anomaly_token_list      # step 2 - anomaly token list 사용 
+    )
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
+
+    steps_per_epoch = math.ceil(len(train_dataloader.dataset) / train_dataloader.batch_size)
+    print(f"Steps per epoch: {steps_per_epoch}")    
+    
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+
+    # Prepare everything with our `accelerator`.
+    text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        text_encoder, optimizer, train_dataloader, lr_scheduler
+    )
+
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move vae and unet to device and cast to weight_dtype
+    unet.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if accelerator.is_main_process:
+        accelerator.init_trackers("textual_inversion", config=vars(args))
+
+    # Train!
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Placeholder token list (Anomaly) = {args.anomaly_token_list}")
     
     global_step = 0
     first_epoch = 0
@@ -831,18 +1228,19 @@ def main(args):
 
                 ### 현재 해당하는 class, anomaly token만 update
                 with accelerator.accumulate(text_encoder):
-                    class_tokens = batch["class_token"]  
+                    # class_tokens = batch["class_token"]  
                     anomaly_tokens = batch["anomaly_token"] 
 
                     # 업데이트된 토큰들의 횟수 증가
-                    for token in class_tokens:
-                        update_count["class_token"][token] += 1
+                    # for token in class_tokens:
+                    #     update_count["class_token"][token] += 1
                     for token in anomaly_tokens:
                         update_count["anomaly_token"][token] += 1
                     # logger.info(f"Updated class token: {class_tokens} / anomaly token: {anomaly_tokens}")
 
                     update_token_ids = [
-                        tokenizer.convert_tokens_to_ids(token) for token in class_tokens + anomaly_tokens
+                        tokenizer.convert_tokens_to_ids(token) for token in anomaly_tokens
+                        # tokenizer.convert_tokens_to_ids(token) for token in class_tokens + anomaly_tokens
                     ]
 
                     # 기존 임베딩 고정 및 특정 토큰 업데이트
@@ -854,43 +1252,6 @@ def main(args):
                         accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
                             index_no_updates
                         ] = orig_embeds_params[index_no_updates]
-
-                    # 학습 중 업데이트된 임베딩 확인
-                    # current_embedding = text_encoder.get_input_embeddings().weight.data.clone()
-                    # with torch.no_grad():
-                    #     for token_id in update_token_ids:
-                    #         print(f"Updated embedding for token {tokenizer.convert_ids_to_tokens(token_id)}")
-                            # print(f"Updated embedding values: {current_embedding[token_id]}")
-                    
-
-                ## 새롭게 추가된 모든 placeholder token의 인덱스 가져오기
-                # placeholder_token_ids = [tokenizer.convert_tokens_to_ids(token) for token in args.placeholder_token_list]   # [49408. 49409. 49410. 49411]
-
-                ### 새롭게 추가된 토큰만 update
-                # index_no_updates = torch.ones(len(tokenizer), dtype=torch.bool, device=accelerator.device)  # [True, ...] 49408 + 4(추가토큰개수) = 49412개
-                # for token_id in placeholder_token_ids:
-                #     index_no_updates[token_id] = False  # 새롭게 추가된 토큰만 False로 설정. 마지막 4개만 False
-                ## 임베딩 업데이트 - 새로 추가된 토큰 제외 원래 임베딩으로 고정.
-                # with torch.no_grad():
-                #     accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
-                #         index_no_updates
-                #     ] = orig_embeds_params[index_no_updates]
-
-                ## 학습 중 업데이트된 임베딩 확인                
-                # original_embedding = orig_embeds_params.clone()
-                # current_embedding = text_encoder.get_input_embeddings().weight.data.clone()
-                # with torch.no_grad():
-                #     for idx in range(len(tokenizer)):
-                #         if idx not in placeholder_token_ids:
-                #             assert torch.equal(original_embedding[idx], current_embedding[idx]), \
-                #                 f"Token ID {idx} (non-placeholder) has been updated!"
-                                
-                #     # 학습하는 토큰 확인
-                #     for token_id in placeholder_token_ids:
-                #         print(f"Updated embedding for token {tokenizer.convert_ids_to_tokens(token_id)}")
-                #         # print(f"Updated embedding for token {tokenizer.convert_ids_to_tokens(token_id)}: {current_embedding[token_id]}")
-
-
 
 
             ## 새롭게 추가된 모든 placeholder token의 인덱스 가져오기
@@ -915,12 +1276,9 @@ def main(args):
                 break
         
         # 학습 종료 후 로깅
-        logger.info("Class token update counts:")
-        for token, count in update_count["class_token"].items():
-            logger.info(f"{token}: {count} updates")
-        logger.info("Anomaly token update counts:")
-        for token, count in update_count["anomaly_token"].items():
-            logger.info(f"{token}: {count} updates")
+        # logger.info("Anomaly token update counts:")
+        # for token, count in update_count["anomaly_token"].items():
+        #     logger.info(f"{token}: {count} updates")
 
     accelerator.wait_for_everyone()
 
@@ -955,6 +1313,68 @@ def generate_anomaly_prompt(class_name, anomaly_name):
     
     return prompt
 
+def generate_images_step1(args, dirname):
+    def load_learned_embeddings(pipe, embed_path):
+        learned_embeds = torch.load(embed_path, map_location="cuda")
+
+        added_tokens = []
+        for token, embedding in learned_embeds.items():
+            pipe.tokenizer.add_tokens(token)
+            added_tokens.append(token)
+
+        pipe.text_encoder.resize_token_embeddings(len(pipe.tokenizer))
+
+        for token, embedding in learned_embeds.items():
+            token_id = pipe.tokenizer.convert_tokens_to_ids(token)
+            pipe.text_encoder.get_input_embeddings().weight.data[token_id] = embedding.cuda()
+
+        print(f"Loaded embeddings for tokens: {', '.join(added_tokens)}")   #  <metal_nut>, <pill>, <scratch>, <color>
+        return added_tokens
+
+    def generate_normal_prompt(added_tokens):
+        prompts = []
+        for class_token in added_tokens:
+            prompt = f"a photo of {class_token}"
+            prompts.append(prompt)
+        return prompts, added_tokens
+
+        # 모델 로드 (한 번만 실행)
+    pipe = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        use_auth_token=True,
+        torch_dtype=torch.float16,
+        revision="fp16",
+        # token=True  # 필요한 경우 토큰 사용
+    ).to('cuda')
+
+    pipe.set_progress_bar_config(disable=True)
+    pipe.safety_checker = None
+
+    embed_path = os.path.join(args.output_dir, f"{dirname}.pt")
+    out_dir = os.path.join(args.output_dir+'_images', 'step_1')
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 학습된 임베딩 로드
+    added_tokens = load_learned_embeddings(pipe, embed_path)
+
+    prompts, class_tokens = generate_normal_prompt(added_tokens)
+    print(f"Class Tokens: {class_tokens}")
+    print(f"Generated Prompts: {prompts}")
+
+    # 각 프롬프트로 이미지 생성
+    for prompt in prompts:
+        prompt_dir = os.path.join(out_dir, prompt.replace(" ", "_"), str(args.guidance_scale))
+
+        os.makedirs(prompt_dir, exist_ok=True)
+
+        for idx in trange(args.num_generate, desc=f"Generating Images for prompt: {prompt}"):
+            with torch.no_grad(), autocast('cuda'):
+                image = pipe(
+                    prompt,
+                    guidance_scale=args.guidance_scale
+                ).images[0]
+
+            image.save(os.path.join(prompt_dir, f"{idx}.png"))
 
 if __name__ == "__main__":
 
@@ -982,7 +1402,7 @@ if __name__ == "__main__":
         if args.seed:
             seed = args.seed
             
-        os.makedirs(os.path.join(output_dir, "extracted"), exist_ok=True)
+        # os.makedirs(os.path.join(output_dir, "extracted"), exist_ok=True)
         train_dataset = DATASETS[args.dataset](args=args, examples_per_class=examples_per_class, seed=seed)
 
         ### 미리 이미지 추출함. extracted/{dataset}-{seed}-{examples_per_class}
@@ -1015,9 +1435,11 @@ if __name__ == "__main__":
         
         args.initializer_token = "the"
         dirname = f"{args.dataset}-{seed}-{examples_per_class}"
-
         args.train_data_dir = os.path.join(output_dir, "extracted", dirname)
-        args.output_dir = os.path.join(output_dir, "fine-tuned", dirname)
+        args.output_dir = os.path.join(output_dir, f"fine-tuned_ep{args.num_train_epochs}", dirname)
         args.seed = seed
 
-        main(args)
+        # main(args)
+        main_step1(args)
+        generate_images_step1(args, dirname)
+        # main_step2(args)
